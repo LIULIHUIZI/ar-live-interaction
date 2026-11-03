@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AR 表情互动测试</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#080e1c;color:white;font-family:system-ui,sans-serif}
+main{max-width:900px;margin:auto;padding:18px}
+h1{font-size:24px;margin:12px 0}
+p{color:#aabbd2;font-size:13px}
+.stage{position:relative;width:100%;aspect-ratio:4/3;background:#142239;overflow:hidden;border-radius:16px;border:1px solid #35465f}
+video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:fill}
+video{transform:scaleX(-1);object-fit:cover}
+canvas{pointer-events:none}
+.status{position:absolute;top:12px;left:12px;background:#071525cc;padding:9px 12px;border-radius:9px;font-size:13px}
+.panel{background:#142239;border:1px solid #35465f;border-radius:14px;padding:15px;margin-top:14px}
+button{background:#b0dcff;color:#102033;border:0;border-radius:9px;padding:11px 15px;margin:3px;font-weight:700;cursor:pointer}
+button.secondary{background:#283f60;color:white}
+#message{margin-top:12px;color:#f4d18b;line-height:1.6}
+.track{height:8px;background:#34435a;border-radius:8px;overflow:hidden;margin:7px 0 15px}
+.fill{height:100%;width:0;background:#77d4ff}
+.info{display:flex;justify-content:space-between;font-size:13px}
+@media(max-width:600px){.stage{aspect-ratio:9/16}}
+
+/* 摄像头 -> 蒙层 -> 特效，分层合成 */
+.stage video {z-index:0}
+.stage .ar-dark-layer {
+ position:absolute;
+ inset:0;
+ z-index:1;
+ background:rgba(0,0,0,.24);
+ opacity:0;
+ pointer-events:none;
+ transition:opacity .22s ease;
+}
+.stage .ar-dark-layer.enabled {opacity:1}
+.stage canvas {z-index:2}
+.stage .status {z-index:3}
+.ar-mask-controls {
+ display:flex;
+ align-items:center;
+ flex-wrap:wrap;
+ gap:10px;
+}
+.ar-mask-hint {
+ font-size:13px;
+ color:#b6c8df;
+ line-height:1.6;
+}
+.ar-mask-controls button[aria-pressed="true"] {
+ background:#86c9ff;
+ color:#07192b;
+}
+
+</style>
+</head>
+<body>
+<main>
+<h1>AR 密集碰撞 v8 · 蒙层增强版</h1>
+<p>微笑下雨 · 张嘴大笑烟花 · 散落粒子碰撞头部</p>
+<div class="stage" id="stage">
+ <video id="video" autoplay muted playsinline></video>
+ <div id="arDarkLayer" class="ar-dark-layer"></div>
+<canvas id="canvas"></canvas>
+ <div class="status" id="state">等待摄像头</div>
+</div>
+
+<div class="panel">
+ <div class="ar-mask-controls">
+  <button id="arMaskToggle"
+          type="button"
+          class="secondary"
+          aria-pressed="false">
+   开启轻微蒙层
+  </button>
+  <span class="ar-mask-hint">
+   ✨ 想让烟花更清晰？开启轻微蒙层，
+   可以增强烟花与背景的对比度。
+  </span>
+ </div>
+</div>
+
+<div class="panel">
+ <button id="start">启动摄像头</button>
+ <button id="rain" class="secondary">手动测试下雨</button>
+ <button id="fire" class="secondary">手动测试烟花</button>
+ <button id="debug" class="secondary">显示头部轮廓</button>
+ <div id="message">点击启动摄像头，等待人脸模型加载。</div>
+</div>
+<div class="panel">
+ <div class="info"><span>微笑分数</span><b id="sv">0.00</b></div>
+ <div class="track"><div class="fill" id="sb"></div></div>
+ <div class="info"><span>张嘴分数</span><b id="jv">0.00</b></div>
+ <div class="track"><div class="fill" id="jb"></div></div>
+ <div class="info"><span>识别状态</span><b id="expression">待机</b></div><div class="info"><span>碰撞次数</span><b id="hits">0</b></div><div class="info"><span>渲染帧率</span><b id="fps">—</b></div>
+ <p>说明：高级 Canvas 视觉与轮廓碰撞验证版。</p>
+</div>
+</main>
+<script type="module">
+const $=id=>document.getElementById(id);
+const video=$("video"),canvas=$("canvas");
+const ctx=canvas.getContext("2d");
+let W=640,H=400,scaleX=1,scaleY=1;
+let stream=null,model=null,active=false;
+let head=null,showHead=false;
+let smile=0,jaw=0,expression="neutral";
+let candidate="neutral",candidateAt=0;
+let lastFire=0,lastDetect=0,lastVideo=-1;
+let rainUntil=0,particles=[],lastFrame=0;let hits=0,marks=[],frameCounter=0,fpsTime=0,lastPaint=0;const MOBILE=matchMedia("(pointer:coarse)").matches;
+const now=()=>performance.now();
+const rand=(a,b)=>a+Math.random()*(b-a);
+function resize(){
+ const r=$("stage").getBoundingClientRect();
+ W=r.width;H=r.height;
+ let d=Math.min(devicePixelRatio||1,1.5);
+ canvas.width=Math.round(W*d);
+ canvas.height=Math.round(H*d);
+ ctx.setTransform(d,0,0,d,0,0);
+}
+new ResizeObserver(resize).observe($("stage"));
+resize();
+
+function addRain(n=8){
+ for(let i=0;i<n;i++){
+  if(particles.length>=340)break;
+  particles.push({
+   type:"rain",x:rand(0,W),y:rand(-35,0),
+   vx:rand(-1.3,-.3),vy:rand(7,11),life:1
+  });
+ }
+}
+
+function addFire(){
+ const x=rand(W*.42,W*.58),y=rand(H*.16,H*.27);
+ const mobile=matchMedia("(pointer:coarse)").matches;
+ const count=mobile?230:360;
+ const palette=[35,48,55,190,210,295,320];
+ const cap=mobile?380:560;
+ for(let i=0;i<count&&particles.length<cap;i++){
+  const a=Math.PI*2*(i+.5)/count;
+  const speed=rand(3.8,6.4)*Math.max(.65,Math.min(1.15,W/650));
+  particles.push({
+   type:"spark",x,y,
+   vx:Math.cos(a)*speed,vy:Math.sin(a)*speed,
+   age:0,life:1,size:rand(1.1,2.5),
+   hue:palette[i%palette.length]+rand(-10,10),
+   tail:[],cooldown:0
+  });
+ }
+ lastFire=now();hits=0;
+}
+
+function faceToScreen(p){
+ const vw=video.videoWidth||640;
+ const vh=video.videoHeight||480;
+ const k=Math.max(W/vw,H/vh);
+ const ox=(W-vw*k)/2;
+ const oy=(H-vh*k)/2;
+ return {
+  x:W-(ox+p.x*vw*k),
+  y:oy+p.y*vh*k
+ };
+}
+const FACE_POINTS=[
+10,338,297,332,284,251,389,356,454,
+323,361,288,397,365,379,378,400,377,
+152,148,176,149,150,136,172,58,132,
+93,234,127,162,21,54,103,67,109
+];
+const cross=(a,b,c,d)=>a*d-b*c;
+
+
+
+// 仅散落阶段检测头顶弧线
+function collideScalp(p,x0,y0){
+ if(!head?.points||p.age<400||
+    p.vy<=0||p.cooldown>0)return false;
+
+ const width=head.maxX-head.minX;
+ const height=head.maxY-head.minY;
+ if(width<15||height<20)return false;
+
+ const cx=(head.minX+head.maxX)/2;
+ const rx=width*.47;
+ const top=head.minY;
+ const arcY=x=>
+  top+Math.pow((x-cx)/rx,2)*height*.18;
+
+ const f0=y0-arcY(x0);
+ const f1=p.y-arcY(p.x);
+ if(!(f0<0&&f1>=0))return false;
+
+ let lo=0,hi=1;
+ for(let k=0;k<7;k++){
+  const m=(lo+hi)/2;
+  const x=x0+(p.x-x0)*m;
+  const y=y0+(p.y-y0)*m;
+  if(y>=arcY(x))hi=m;
+  else lo=m;
+ }
+
+ const x=x0+(p.x-x0)*hi;
+ const y=y0+(p.y-y0)*hi;
+ if(x<cx-rx||x>cx+rx)return false;
+
+ const slope=2*(x-cx)*height*.18/(rx*rx);
+ let nx=slope,ny=-1;
+ const len=Math.hypot(nx,ny);
+ nx/=len;
+ ny/=len;
+
+ const dot=p.vx*nx+p.vy*ny;
+ if(dot>=0)return false;
+
+ const bounce=.58;
+ p.vx-=(1+bounce)*dot*nx;
+ p.vy-=(1+bounce)*dot*ny;
+
+ p.x=x+nx*2;
+ p.y=y+ny*2;
+ p.cooldown=8;
+ hits++;
+
+ if(showHead){
+  marks.push({x,y,life:18});
+  if(marks.length>25)marks.shift();
+ }
+ return true;
+}
+
+function collision(p,x0,y0){
+ if(!head?.points||p.age<400||p.vy<=0||p.cooldown>0)return;
+ if(Math.max(x0,p.x)<head.minX||
+ Math.min(x0,p.x)>head.maxX||
+ Math.max(y0,p.y)<head.minY||
+ Math.min(y0,p.y)>head.maxY)return;
+ const vx=p.x-x0,vy=p.y-y0;
+ let first=2,hit=null,nx=0,ny=0;
+ const pts=head.points;
+ for(let i=0;i<pts.length;i++){
+  const a=pts[i],b=pts[(i+1)%pts.length];
+  const sx=b.x-a.x,sy=b.y-a.y;
+  const den=cross(vx,vy,sx,sy);
+  if(Math.abs(den)<1e-8)continue;
+  const dx=a.x-x0,dy=a.y-y0;
+  const t=cross(dx,dy,sx,sy)/den;
+  const u=cross(dx,dy,vx,vy)/den;
+  if(t<0||t>1||u<0||u>1||t>=first)continue;
+  let ox=sy,oy=-sx;
+  const len=Math.hypot(ox,oy)||1;
+  ox/=len;oy/=len;
+  if(((a.x+b.x)/2-head.x)*ox+
+     ((a.y+b.y)/2-head.y)*oy<0){
+    ox=-ox;oy=-oy;
+  }
+  if(p.vx*ox+p.vy*oy>=0)continue;
+  first=t;hit={x:x0+t*vx,y:y0+t*vy};
+  nx=ox;ny=oy;
+ }
+ if(!hit)return;
+ const dot=p.vx*nx+p.vy*ny;
+ p.vx-=1.58*dot*nx;
+ p.vy-=1.58*dot*ny;
+ p.x=hit.x+nx*2;
+ p.y=hit.y+ny*2;
+ p.cooldown=8;
+ hits++;
+ if(showHead){
+  marks.push({x:hit.x,y:hit.y,life:18});
+  if(marks.length>25)marks.shift();
+ }
+}
+
+function draw(t){
+ if(t-lastPaint<(MOBILE?32:16)){
+  requestAnimationFrame(draw);
+  return;
+ }
+ lastPaint=t;
+ const dt=Math.min(2.3,Math.max(.4,(t-lastFrame||16.7)/16.7));
+ lastFrame=t;
+ ctx.clearRect(0,0,W,H);
+ if(active&&expression==="smile"&&t<rainUntil&&Math.random()<.7){
+  addRain(3);
+ }
+ ctx.save();
+ ctx.globalCompositeOperation="lighter";
+ for(let i=particles.length-1;i>=0;i--){
+  const p=particles[i];
+  if(p.type==="rain"){
+   p.x+=p.vx*dt;p.y+=p.vy*dt;
+   ctx.strokeStyle="rgba(130,198,255,.65)";
+   ctx.lineWidth=1.5;
+   ctx.beginPath();
+   ctx.moveTo(p.x,p.y);
+   ctx.lineTo(p.x-p.vx*2,p.y-11);
+   ctx.stroke();
+   if(p.y>H+20)particles.splice(i,1);
+  }else{
+
+   const x0=p.x,y0=p.y;
+   p.age+=16.7*dt;
+   if(p.age>400){
+    p.vy+=.16*dt;
+    p.vx*=Math.pow(.992,dt);
+    p.vy*=Math.pow(.996,dt);
+   }else{
+    p.vx*=Math.pow(.99,dt);
+    p.vy*=Math.pow(.99,dt);
+   }
+   p.x+=p.vx*dt;
+   p.y+=p.vy*dt;
+   if(p.cooldown>0)p.cooldown--;
+   if(p.age>400&&!collideScalp(p,x0,y0))collision(p,x0,y0);
+   p.life=p.age<400?1:
+      Math.max(0,1-(p.age-400)/2500);
+
+   ctx.globalAlpha=p.life*.9;
+   ctx.strokeStyle=`hsl(${p.hue} 100% 75%)`;
+   ctx.lineWidth=p.size;
+   ctx.beginPath();
+   ctx.moveTo(x0,y0);
+   ctx.lineTo(p.x,p.y);
+   ctx.stroke();
+   ctx.shadowBlur=0;
+   ctx.shadowColor=`hsl(${p.hue} 100% 65%)`;
+   ctx.strokeStyle=`hsl(${p.hue} 100% 72%)`;
+   ctx.lineWidth=p.size;
+   ctx.beginPath();
+   p.tail.forEach((v,i)=>{
+    if(i)ctx.lineTo(v.x,v.y);
+    else ctx.moveTo(v.x,v.y);
+   });
+   ctx.stroke();
+   ctx.shadowBlur=0;
+   if(p.life<=0||p.y>H+25||
+      p.x< -40||p.x>W+40)
+      particles.splice(i,1);
+
+
+  }
+ }
+ ctx.restore();
+
+ if(t-fpsTime>1000){
+  $("fps").textContent=String(frameCounter);
+  frameCounter=0;fpsTime=t;
+ }
+ frameCounter++;
+ $("hits").textContent=String(hits);
+ if(showHead&&head?.points){
+  ctx.strokeStyle="#62ffb0";
+  ctx.lineWidth=2;
+  ctx.beginPath();
+  head.points.forEach((p,i)=>{
+   if(i)ctx.lineTo(p.x,p.y);
+   else ctx.moveTo(p.x,p.y);
+  });
+  ctx.closePath();
+  ctx.stroke();
+  for(let i=marks.length-1;i>=0;i--){
+   const m=marks[i];
+   ctx.fillStyle="#ff5476";
+   ctx.beginPath();
+   ctx.arc(m.x,m.y,4,0,Math.PI*2);
+   ctx.fill();
+   if(--m.life<=0)marks.splice(i,1);
+  }
+ }
+
+ requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+function score(c,n){
+ return c.find(v=>v.categoryName===n)?.score||0;
+}
+function processFace(result,t){
+ const cats=result.faceBlendshapes?.[0]?.categories||[];
+ const lm=result.faceLandmarks?.[0];
+ if(!lm){
+  head=null;smile=0;jaw=0;
+  updateState("neutral",t);return;
+ }
+ const raw=(score(cats,"mouthSmileLeft")+score(cats,"mouthSmileRight"))/2;
+ const rawJaw=score(cats,"jawOpen");
+ smile=smile*.55+raw*.45;
+ jaw=jaw*.55+rawJaw*.45;
+ $("sv").textContent=smile.toFixed(2);
+ $("jv").textContent=jaw.toFixed(2);
+ $("sb").style.width=(smile*100)+"%";
+ $("jb").style.width=(jaw*100)+"%";
+
+ 
+const contourRaw=FACE_POINTS.map(i=>faceToScreen(lm[i]));
+
+const top=Math.min(...contourRaw.map(p=>p.y));
+const bottom=Math.max(...contourRaw.map(p=>p.y));
+const faceH=Math.max(1,bottom-top);
+const midX=contourRaw.reduce(
+ (sum,p)=>sum+p.x,0
+)/contourRaw.length;
+
+for(let i=0;i<contourRaw.length;i++){
+ const p=contourRaw[i];
+ const weight=Math.max(0,Math.min(1,
+  (top+.50*faceH-p.y)/(.50*faceH)
+ ));
+ p.y-=faceH*.26*weight;
+ p.x+=(p.x-midX)*.08*weight;
+}
+
+ const cx=contourRaw.reduce((n,p)=>n+p.x,0)/contourRaw.length;
+ const cy=contourRaw.reduce((n,p)=>n+p.y,0)/contourRaw.length;
+ const old=head?.points;
+ const pts=contourRaw.map((p,i)=>{
+  const dx=p.x-cx,dy=p.y-cy;
+  const len=Math.hypot(dx,dy)||1;
+  const x=p.x+dx/len*3,y=p.y+dy/len*3;
+  return old?.length===contourRaw.length?{
+   x:old[i].x*.55+x*.45,
+   y:old[i].y*.55+y*.45
+  }:{x,y};
+ });
+ head={
+  points:pts,x:cx,y:cy,
+  minX:Math.min(...pts.map(p=>p.x)),
+  maxX:Math.max(...pts.map(p=>p.x)),
+  minY:Math.min(...pts.map(p=>p.y)),
+  maxY:Math.max(...pts.map(p=>p.y))
+ };
+
+ let desired="neutral";
+ if(smile>.48&&jaw>.50)desired="laugh";
+ else if(smile>.40&&jaw<.43)desired="smile";
+ updateState(desired,t);
+}
+function updateState(desired,t){
+ if(desired!==candidate){
+  candidate=desired;candidateAt=t;
+ }
+ if(desired!==expression&&t-candidateAt>220){
+  expression=desired;
+  if(expression==="laugh"&&t-lastFire>1800)addFire();
+ }
+ if(expression==="smile")rainUntil=t+180;
+ $("expression").textContent=
+ expression==="laugh"?"大笑 · 烟花":
+ expression==="smile"?"微笑 · 下雨":"中性";
+ $("state").textContent=$("expression").textContent;
+}
+async function start(){
+ $("start").disabled=true;
+ $("message").textContent="正在申请摄像头权限...";
+ try{
+  if(!navigator.mediaDevices?.getUserMedia)
+   throw Error("当前地址不支持摄像头，请使用 localhost");
+  stream=await navigator.mediaDevices.getUserMedia({
+   audio:false,
+   video:{facingMode:"user",width:{ideal:640},height:{ideal:480}}
+  });
+  video.srcObject=stream;
+  await video.play();
+  $("message").textContent="摄像头成功，正在加载人脸识别模型...";
+  const pkg=await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm");
+  const vision=await pkg.FilesetResolver.forVisionTasks(
+   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  const opts={
+   baseOptions:{
+    modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+    delegate:"GPU"
+   },
+   runningMode:"VIDEO",
+   numFaces:1,
+   outputFaceBlendshapes:true
+  };
+  try{
+   model=await pkg.FaceLandmarker.createFromOptions(vision,opts);
+  }catch(e){
+   opts.baseOptions.delegate="CPU";
+   model=await pkg.FaceLandmarker.createFromOptions(vision,opts);
+  }
+  active=true;
+  $("message").textContent="识别已启动，请微笑或张嘴大笑。";
+  detect();
+ }catch(e){
+  $("message").textContent="启动失败："+e.message;
+  $("start").disabled=false;
+  if(stream)stream.getTracks().forEach(x=>x.stop());
+ }
+}
+function detect(){
+ if(!active)return;
+ const t=now();
+ if(video.readyState>=2&&video.currentTime!==lastVideo&&t-lastDetect>100){
+  lastVideo=video.currentTime;
+  lastDetect=t;
+  try{
+   processFace(model.detectForVideo(video,t),t);
+  }catch(e){
+   $("message").textContent="识别异常："+e.message;
+  }
+ }
+ requestAnimationFrame(detect);
+}
+$("start").addEventListener("click",start);
+$("rain").addEventListener("click",()=>{
+ for(let i=0;i<16;i++)addRain(8);
+ $("message").textContent="已手动生成雨滴";
+});
+$("fire").addEventListener("click",()=>{
+ addFire();
+ $("message").textContent="已手动生成烟花";
+});
+$("debug").addEventListener("click",()=>{
+ showHead=!showHead;
+ $("debug").textContent=showHead?"隐藏头部轮廓":"显示头部轮廓";
+});
+window.addEventListener("pagehide",()=>{
+ stream?.getTracks().forEach(x=>x.stop());
+ model?.close();
+});
+</script>
+
+<script>
+(function(){
+ const layer=document.getElementById("arDarkLayer");
+ const button=document.getElementById("arMaskToggle");
+ if(!layer||!button)return;
+
+ let enabled=false;
+
+ button.addEventListener("click",function(){
+  enabled=!enabled;
+  layer.classList.toggle("enabled",enabled);
+  button.textContent=enabled
+   ?"关闭轻微蒙层"
+   :"开启轻微蒙层";
+  button.setAttribute("aria-pressed",String(enabled));
+ });
+})();
+</script>
+
+</body>
+</html>
